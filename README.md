@@ -1,23 +1,27 @@
-﻿# Claude API チャットアプリ
+﻿## Web検索機能（Brave Search API）
 
-Claude APIを使用した高機能チャットアプリケーションです。
+### 新機能
+- ✅ リアルタイムWeb検索
+- ✅ 最新情報の取得
+- ✅ ディープリサーチモード（複数回検索）
+- ✅ 検索プロセスの可視化
 
-## 機能
+### 使い方
 
-- 最新のClaude 4.5 Sonnet、4.1 Opusに対応
-- ファイル添付機能（画像・テキスト）
-- ストリーミング応答
-- パスワード認証
-- トークン使用量・コスト表示
-- 会話の保存機能
+1. **Brave Search APIキーの取得**
+   - https://api-dashboard.search.brave.com/register でアカウント作成
+   - Free AIプラン（月2,000検索まで無料）を選択
+   - APIキーを取得
 
-## 使用方法
+2. **Secretsへの追加**
+   - Streamlit Cloud > Settings > Secrets
+   - `BRAVE_SEARCH_API_KEY = "your-key"` を追加
 
-1. Streamlit Community Cloudにデプロイ
-2. SecretsにAPIキーとパスワードを設定
-3. アクセスしてパスワードを入力
+3. **検索の使用**
+   - サイドバーで「Web検索を有効化」をON
+   - 検索結果数を調整（1-10件）
+   - ディープリサーチモードをONにすると3回の検索を実行
 
-## 必要な環境変数
+### 使用例
 
-- `ANTHROPIC_API_KEY`: AnthropicのAPIキー
-- `APP_PASSWORD`: アプリへのアクセス用パスワード
+**通常検索:**

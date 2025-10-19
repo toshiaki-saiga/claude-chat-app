@@ -4,6 +4,15 @@ import base64
 from PIL import Image
 import io
 
+# ===== Web Search Integration =====
+from langchain_anthropic import ChatAnthropic
+from langchain_community.tools import BraveSearch
+from langchain.agents import AgentExecutor, create_react_agent
+from langchain import hub
+from langchain_community.callbacks.streamlit import StreamlitCallbackHandler
+import time
+from datetime import datetime
+
 # ページ設定
 st.set_page_config(
     page_title="Claude API チャット",
@@ -45,14 +54,170 @@ def check_password():
 if not check_password():
     st.stop()
 
-# ===== パスワード認証後にAPI クライアント初期化 =====
+# ===== LangChain Search Agent Initialization =====
+@st.cache_resource
+def init_search_agent(model_name: str, search_results: int = 5):
+    """
+    LangChain ReActエージェントを初期化
+    
+    Args:
+        model_name: 使用するClaudeモデル名
+        search_results: 検索結果の数
+        
+    Returns:
+        AgentExecutor: 初期化されたエージェント実行環境
+    """
+    try:
+        # Claude LLMの初期化（LangChain統合版）
+        llm = ChatAnthropic(
+            model=model_name,
+            temperature=0.3,  # 検索時は低温度で正確性を重視
+            max_tokens=4096,
+            streaming=True,
+            anthropic_api_key=st.secrets["ANTHROPIC_API_KEY"]
+        )
+        
+        # Brave Searchツールの初期化
+        brave_search = BraveSearch.from_api_key(
+            api_key=st.secrets["BRAVE_SEARCH_API_KEY"],
+            search_kwargs={
+                "count": search_results,
+                "safesearch": "moderate"  # セーフサーチを有効化
+            }
+        )
+        
+        tools = [brave_search]
+        
+        # ReActプロンプトテンプレートの取得
+        # このプロンプトは「思考→行動→観察」のサイクルを実装
+        prompt = hub.pull("hwchase17/react")
+        
+        # エージェントの作成
+        agent = create_react_agent(llm, tools, prompt)
+        
+        # エージェント実行環境の作成
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True,  # デバッグ用に詳細ログを出力
+            handle_parsing_errors=True,  # パースエラーを自動処理
+            max_iterations=5,  # 無限ループ防止
+            max_execution_time=120,  # 2分でタイムアウト
+            early_stopping_method="generate"  # 早期終了戦略
+        )
+        
+        return agent_executor
+        
+    except Exception as e:
+        st.error(f"エージェント初期化エラー: {str(e)}")
+        return None
+
+
+def rate_limited_search(func):
+    """
+    Brave Search APIのレート制限（1秒1リクエスト）に対応するデコレータ
+    
+    無料プランの制約:
+    - 1秒あたり1リクエスト
+    - 月間2,000リクエスト
+    """
+    last_call_time = [0]  # リストで包んで参照を保持
+    
+    def wrapper(*args, **kwargs):
+        current_time = time.time()
+        time_since_last_call = current_time - last_call_time[0]
+        
+        # 前回の呼び出しから1秒未満の場合は待機
+        if time_since_last_call < 1.0:
+            sleep_time = 1.0 - time_since_last_call
+            with st.spinner(f'レート制限のため {sleep_time:.1f}秒待機中...'):
+                time.sleep(sleep_time)
+        
+        result = func(*args, **kwargs)
+        last_call_time[0] = time.time()
+        
+        # 検索カウントの更新
+        if "search_count_today" not in st.session_state:
+            st.session_state.search_count_today = 0
+        st.session_state.search_count_today += 1
+        
+        return result
+    
+    return wrapper
+
+
+@rate_limited_search
+def execute_deep_research(agent_executor, query: str, iterations: int = 3):
+    """
+    ディープリサーチ: 複数回の検索と分析を実行
+    
+    Args:
+        agent_executor: 初期化されたエージェント
+        query: ユーザーのクエリ
+        iterations: 検索の繰り返し回数
+        
+    Returns:
+        list: 各検索の結果のリスト
+    """
+    results = []
+    
+    with st.status("🔍 ディープリサーチ実行中...", expanded=True) as status:
+        # 初回検索
+        st.write(f"**検索 1/{iterations}**: 基本情報の収集")
+        try:
+            initial_result = agent_executor.invoke({"input": query})
+            results.append({
+                "iteration": 1,
+                "type": "initial",
+                "result": initial_result
+            })
+            st.success("✅ 初回検索完了")
+        except Exception as e:
+            st.error(f"❌ 初回検索エラー: {str(e)}")
+            return results
+        
+        # 追加の深掘り検索
+        for i in range(iterations - 1):
+            st.write(f"**検索 {i+2}/{iterations}**: 詳細情報の追加収集")
+            
+            # 前回の結果から追加の質問を生成
+            follow_up_query = f"""
+            以下のトピックについて、さらに詳しく調査してください：
+            {query}
+            
+            前回の検索で得られた情報を踏まえて、特に以下の観点で情報を補完してください：
+            - 最新の動向やトレンド（過去6ヶ月以内）
+            - 具体的な数値データや統計
+            - 専門家の意見や評価
+            - 実際の事例やケーススタディ
+            
+            前回取得できなかった新しい情報を重点的に調査してください。
+            """
+            
+            try:
+                result = agent_executor.invoke({"input": follow_up_query})
+                results.append({
+                    "iteration": i + 2,
+                    "type": "follow_up",
+                    "result": result
+                })
+                st.success(f"✅ 検索 {i+2} 完了")
+                
+                # レート制限対策: 1秒待機
+                time.sleep(1)
+                
+            except Exception as e:
+                st.warning(f"⚠️ 検索 {i+2} でエラー: {str(e)}")
+                continue
+        
+        status.update(label="✅ ディープリサーチ完了", state="complete")
+    
+    return results
+
+# ===== API クライアント初期化 =====
 @st.cache_resource
 def get_client():
-    try:
-        return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
-    except Exception as e:
-        st.error(f"APIクライアントの初期化に失敗しました: {str(e)}")
-        st.stop()
+    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 client = get_client()
 
@@ -144,6 +309,44 @@ with st.sidebar:
     # コスト試算
     if 'total_tokens' in st.session_state:
         st.caption(f"📊 累計トークン: {st.session_state.total_tokens:,}")
+    
+    # ===== Web Search Settings =====
+    st.divider()
+    st.subheader("🔍 Web検索設定")
+    
+    enable_search = st.toggle(
+        "Web検索を有効化",
+        value=False,
+        help="有効にすると、Claudeが必要に応じて最新のWeb情報を検索します"
+    )
+    
+    if enable_search:
+        search_count = st.slider(
+            "検索結果数",
+            min_value=1,
+            max_value=10,
+            value=5,
+            step=1,
+            help="検索する結果の数（多いほど詳細ですが時間がかかります）"
+        )
+        
+        deep_research = st.checkbox(
+            "🔬 ディープリサーチモード",
+            value=False,
+            help="3回の検索を実行してより包括的な情報を収集します"
+        )
+        
+        if "BRAVE_SEARCH_API_KEY" not in st.secrets:
+            st.error("❌ Brave Search APIキーが設定されていません")
+            st.caption("📝 .streamlit/secrets.tomlに以下を追加してください:")
+            st.code('BRAVE_SEARCH_API_KEY = "your-key"')
+            enable_search = False
+        else:
+            st.success("✅ Brave Search API 設定済み")
+            if "search_count_today" in st.session_state:
+                st.caption(f"🔍 本日の検索回数: {st.session_state.search_count_today}/2000")
+    
+    st.divider()
 
 # ===== メインエリア =====
 st.title("🤖 Claude API チャット")
@@ -248,69 +451,143 @@ if prompt := st.chat_input("メッセージを入力してください..."):
         if len(user_message_content) > 1:
             st.info("🖼️ 画像が添付されています")
     
-    # Claude からの応答を取得（ストリーミング）
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-        
-        try:
-            # API呼び出し用のメッセージ形式に変換
-            api_messages = []
-            for msg in st.session_state.messages:
-                api_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
-            
-            # ストリーミング応答
-            with client.messages.stream(
-                model=selected_model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                messages=api_messages
-            ) as stream:
-                for text in stream.text_stream:
-                    full_response += text
-                    message_placeholder.markdown(full_response + "▌")
+    full_response = ""
+    
+    # ===== Web検索モード =====
+    if enable_search and "BRAVE_SEARCH_API_KEY" in st.secrets:
+        with st.chat_message("assistant"):
+            try:
+                # エージェントの初期化
+                agent_executor = init_search_agent(
+                    selected_model,
+                    search_count if 'search_count' in locals() else 5
+                )
                 
-                # 最終的なレスポンスを表示
-                message_placeholder.markdown(full_response)
-                
-                # トークン情報を取得
-                final_message = stream.get_final_message()
-                input_tokens = final_message.usage.input_tokens
-                output_tokens = final_message.usage.output_tokens
-                
-                # 累計トークンを更新
-                st.session_state.total_tokens += input_tokens + output_tokens
-                
-                # トークン使用量を表示
-                with st.expander("📊 使用トークン情報"):
-                    st.write(f"入力トークン: {input_tokens:,}")
-                    st.write(f"出力トークン: {output_tokens:,}")
-                    
-                    # コスト試算
-                    if "opus-4" in selected_model:
-                        input_cost = (input_tokens / 1_000_000) * 15
-                        output_cost = (output_tokens / 1_000_000) * 75
-                    elif "sonnet-4" in selected_model:
-                        input_cost = (input_tokens / 1_000_000) * 3
-                        output_cost = (output_tokens / 1_000_000) * 15
-                    elif "sonnet" in selected_model:
-                        input_cost = (input_tokens / 1_000_000) * 3
-                        output_cost = (output_tokens / 1_000_000) * 15
-                    elif "haiku" in selected_model:
-                        input_cost = (input_tokens / 1_000_000) * 1
-                        output_cost = (output_tokens / 1_000_000) * 5
+                if agent_executor is None:
+                    st.error("エージェントの初期化に失敗しました。通常モードで回答します。")
+                    enable_search = False
+                else:
+                    # ディープリサーチモードの判定
+                    if 'deep_research' in locals() and deep_research:
+                        st.info("🔬 ディープリサーチモードで実行します（3回の検索）")
+                        
+                        # ディープリサーチ実行
+                        results = execute_deep_research(
+                            agent_executor,
+                            prompt,
+                            iterations=3
+                        )
+                        
+                        # 結果の統合
+                        full_response = f"# 🔬 ディープリサーチ結果\n\n"
+                        full_response += f"**検索クエリ:** {prompt}\n\n"
+                        full_response += f"**実行時刻:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                        full_response += "---\n\n"
+                        
+                        for idx, res in enumerate(results, 1):
+                            full_response += f"## 検索フェーズ {idx}\n\n"
+                            full_response += res["result"]["output"] + "\n\n"
+                            full_response += "---\n\n"
+                        
+                        # 統合サマリー
+                        full_response += "## 📊 総合まとめ\n\n"
+                        full_response += f"上記{len(results)}回の検索から得られた情報を統合し、"
+                        full_response += "最新かつ包括的な回答を提供しました。\n"
+                        
                     else:
-                        input_cost = output_cost = 0
+                        # 通常の検索（1回）
+                        st.info("🔍 Web検索を使用して回答を生成しています...")
+                        
+                        with st.expander("🔍 検索プロセス（詳細）", expanded=False):
+                            st_callback = StreamlitCallbackHandler(st.container())
+                            result = agent_executor.invoke(
+                                {"input": prompt},
+                                {"callbacks": [st_callback]}
+                            )
+                        
+                        full_response = result["output"]
                     
-                    total_cost = input_cost + output_cost
-                    st.write(f"💰 このメッセージのコスト: ${total_cost:.6f}")
+                    # レスポンスを表示
+                    st.markdown(full_response)
+                    
+                    # 検索情報の表示
+                    with st.expander("📊 検索情報"):
+                        st.write("✅ Web検索を使用して最新情報を取得しました")
+                        st.write(f"**検索結果数:** {search_count if 'search_count' in locals() else 5}件")
+                        if 'deep_research' in locals() and deep_research:
+                            st.write(f"**モード:** ディープリサーチ（3回検索）")
+                        else:
+                            st.write(f"**モード:** 通常検索（1回）")
+                        st.write(f"**使用モデル:** {selected_model_name}")
+                        
+            except Exception as e:
+                st.error(f"❌ 検索中にエラーが発生しました")
+                st.exception(e)
+                st.info("💡 通常モードで回答を試みます")
+                enable_search = False  # エラー時は通常モードにフォールバック
+    
+    # ===== 通常のClaude API呼び出し =====
+    if not enable_search or "BRAVE_SEARCH_API_KEY" not in st.secrets:
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+            
+            try:
+                # API呼び出し用のメッセージ形式に変換
+                api_messages = []
+                for msg in st.session_state.messages:
+                    api_messages.append({
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    })
                 
-        except Exception as e:
-            st.error(f"❌ エラーが発生しました: {str(e)}")
-            full_response = None
+                # ストリーミング応答
+                with client.messages.stream(
+                    model=selected_model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    messages=api_messages
+                ) as stream:
+                    for text in stream.text_stream:
+                        full_response += text
+                        message_placeholder.markdown(full_response + "▌")
+                    
+                    # 最終的なレスポンスを表示
+                    message_placeholder.markdown(full_response)
+                    
+                    # トークン情報を取得
+                    final_message = stream.get_final_message()
+                    input_tokens = final_message.usage.input_tokens
+                    output_tokens = final_message.usage.output_tokens
+                    
+                    # 累計トークンを更新
+                    st.session_state.total_tokens += input_tokens + output_tokens
+                    
+                    # トークン使用量を表示
+                    with st.expander("📊 使用トークン情報"):
+                        st.write(f"入力トークン: {input_tokens:,}")
+                        st.write(f"出力トークン: {output_tokens:,}")
+                        
+                        # コスト試算
+                        if "opus-4" in selected_model:
+                            input_cost = (input_tokens / 1_000_000) * 15.00
+                            output_cost = (output_tokens / 1_000_000) * 75.00
+                        elif "sonnet-4" in selected_model:
+                            input_cost = (input_tokens / 1_000_000) * 3.00
+                            output_cost = (output_tokens / 1_000_000) * 15.00
+                        elif "haiku" in selected_model:
+                            input_cost = (input_tokens / 1_000_000) * 0.25
+                            output_cost = (output_tokens / 1_000_000) * 1.25
+                        else:
+                            input_cost = (input_tokens / 1_000_000) * 3.00
+                            output_cost = (output_tokens / 1_000_000) * 15.00
+                        
+                        total_cost = input_cost + output_cost
+                        st.write(f"💰 このメッセージのコスト: ${total_cost:.6f}")
+                    
+            except Exception as e:
+                st.error(f"❌ エラーが発生しました: {str(e)}")
+                full_response = None
     
     # アシスタントメッセージを履歴に追加
     if full_response:
@@ -322,4 +599,5 @@ if prompt := st.chat_input("メッセージを入力してください..."):
 # フッター
 st.divider()
 st.caption("💡 ヒント: 左側のサイドバーでモデルやファイルを選択できます")
+st.caption("🔍 Web検索を有効にすると、最新情報を取得できます")
 st.caption("🔒 このアプリはパスワードで保護されています")
