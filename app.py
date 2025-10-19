@@ -45,15 +45,14 @@ def check_password():
 if not check_password():
     st.stop()
 
-# ===== API クライアント初期化 =====
-# デバッグ用に変更
+# ===== パスワード認証後にAPI クライアント初期化 =====
 @st.cache_resource
 def get_client():
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-    # APIキーの最初と最後だけ表示（セキュリティのため）
-    st.write(f"API Key loaded: {api_key[:10]}...{api_key[-10:] if len(api_key) > 20 else 'TOO_SHORT'}")
-    st.write(f"API Key length: {len(api_key)}")
-    return anthropic.Anthropic(api_key=api_key)
+    try:
+        return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    except Exception as e:
+        st.error(f"APIクライアントの初期化に失敗しました: {str(e)}")
+        st.stop()
 
 client = get_client()
 
