@@ -46,9 +46,14 @@ if not check_password():
     st.stop()
 
 # ===== API クライアント初期化 =====
+# デバッグ用に変更
 @st.cache_resource
 def get_client():
-    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    # APIキーの最初と最後だけ表示（セキュリティのため）
+    st.write(f"API Key loaded: {api_key[:10]}...{api_key[-10:] if len(api_key) > 20 else 'TOO_SHORT'}")
+    st.write(f"API Key length: {len(api_key)}")
+    return anthropic.Anthropic(api_key=api_key)
 
 client = get_client()
 
