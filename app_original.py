@@ -55,84 +55,107 @@ if not check_password():
 @st.cache_resource  
 def init_brave_search(search_results: int = 5):
     """
-    Brave Searchツールを初期化
+    LangChain ReActエージェントを初期化
     
     Args:
+        model_name: 使用するClaudeモデル名
         search_results: 検索結果の数
         
     Returns:
-        BraveSearch: 初期化されたBrave Searchツール
+        AgentExecutor: 初期化されたエージェント実行環境
     """
     try:
+        # Claude LLMの初期化（LangChain統合版）
+        llm = ChatAnthropic(
+            model=model_name,
+            temperature=0.3,  # 検索時は低温度で正確性を重視
+            max_tokens=4096,
+            streaming=True,
+            anthropic_api_key=st.secrets["ANTHROPIC_API_KEY"]
+        )
+        
+        # Brave Searchツールの初期化
         brave_search = BraveSearch.from_api_key(
             api_key=st.secrets["BRAVE_SEARCH_API_KEY"],
             search_kwargs={
                 "count": search_results,
-                "safesearch": "moderate"
+                "safesearch": "moderate"  # セーフサーチを有効化
             }
         )
-        return brave_search
-    except Exception as e:
-        st.error(f"Brave Search初期化エラー: {str(e)}")
-        return None
-
-def perform_search_and_generate_response(model_name: str, brave_search, query: str):
-    """
-    検索を実行してレスポンスを生成
-    
-    Args:
-        model_name: Claudeモデル名
-        brave_search: 検索ツール
-        query: 検索クエリ
         
-    Returns:
-        str: 検索結果を含む回答
-    """
-    try:
-        # 現在の日時情報
+        tools = [brave_search]
+        
+        # 現在日時を取得
         current_datetime = datetime.now().strftime("%Y年%m月%d日 %H時%M分")
         current_weekday = datetime.now().strftime("%A")
+        
+        # 日本語曜日の変換
         weekday_jp = {
             "Monday": "月曜日", "Tuesday": "火曜日", "Wednesday": "水曜日",
             "Thursday": "木曜日", "Friday": "金曜日", "Saturday": "土曜日", "Sunday": "日曜日"
         }
         current_weekday_jp = weekday_jp.get(current_weekday, current_weekday)
         
-        # 日付関連の質問かチェック
-        date_keywords = ["今日", "日付", "何日", "いつ", "曜日", "today", "date"]
-        is_date_question = any(keyword in query.lower() for keyword in date_keywords)
+        # 標準のReActプロンプトテンプレートを取得し、現在日時情報を追加
+        try:
+            prompt = hub.pull("hwchase17/react")
+            # プロンプトのテンプレート文字列を取得
+            original_template = prompt.template
+            
+            # 現在日時情報を追加したテンプレートを作成
+            from langchain_core.prompts import PromptTemplate
+            modified_template = f"""現在の日時: {current_datetime} ({current_weekday_jp})
+
+重要: 現在の日付や時刻について質問された場合は、上記の現在日時情報を使用して直接回答してください。検索は不要です。
+
+{original_template}"""
+            
+            formatted_prompt = PromptTemplate.from_template(modified_template)
         
-        if is_date_question and not any(keyword in query.lower() for keyword in ["ニュース", "news", "最新", "トレンド"]):
-            # 日付関連の基本質問は検索せずに直接回答
-            return f"現在の日時は{current_datetime}（{current_weekday_jp}）です。"
+        except Exception as e:
+            # hub.pullが失敗した場合のフォールバック
+            from langchain_core.prompts import PromptTemplate
+            formatted_prompt = PromptTemplate.from_template(
+                f"""現在の日時: {current_datetime} ({current_weekday_jp})
+
+あなたは質問に答えるためにツールを使用できるアシスタントです。現在の日付や時刻について質問された場合は、上記の日時情報を使用してください。
+
+利用可能なツール:
+{{tools}}
+
+以下のフォーマットを使用してください:
+
+質問: {{input}}
+思考: 何をすべきかを考える
+行動: [{{tool_names}}]から1つ選択
+行動入力: アクションへの入力  
+観察: アクションの結果
+思考: 最終的な答えがわかった
+最終回答: 元の質問への回答
+
+{{agent_scratchpad}}"""
+            )
         
-        # Web検索を実行
-        search_results = brave_search.run(query)
+        # エージェントの作成
+        agent = create_react_agent(llm, tools, formatted_prompt)
         
-        # LLMの初期化
-        llm = ChatAnthropic(
-            model=model_name,
-            temperature=0.3,
-            max_tokens=4096,
-            anthropic_api_key=st.secrets["ANTHROPIC_API_KEY"]
+        # エージェント実行環境の作成
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True,  # デバッグ用に詳細ログを出力
+            handle_parsing_errors=True,  # パースエラーを自動処理
+            max_iterations=5,  # 無限ループ防止
+            max_execution_time=120,  # 2分でタイムアウト
+            early_stopping_method="generate"  # 早期終了戦略
         )
         
-        # 検索結果を使って回答を生成
-        enhanced_prompt = f"""現在の日時: {current_datetime} ({current_weekday_jp})
-
-以下の検索結果を参考に、ユーザーの質問「{query}」に対して正確で詳しい回答をしてください。
-
-検索結果:
-{search_results}
-
-上記の情報を基に、質問に対する包括的で正確な回答を日本語で提供してください。現在の日時情報も必要に応じて活用してください。"""
-        
-        # LLMに回答生成を依頼
-        response = llm.invoke([{"role": "user", "content": enhanced_prompt}])
-        return response.content
+        return agent_executor
         
     except Exception as e:
-        return f"検索中にエラーが発生しました: {str(e)}"
+        st.error(f"エージェント初期化エラー: {str(e)}")
+        return None
+
 
 def rate_limited_search(func):
     """
@@ -165,6 +188,75 @@ def rate_limited_search(func):
         return result
     
     return wrapper
+
+
+@rate_limited_search
+def execute_deep_research(agent_executor, query: str, iterations: int = 3):
+    """
+    ディープリサーチ: 複数回の検索と分析を実行
+    
+    Args:
+        agent_executor: 初期化されたエージェント
+        query: ユーザーのクエリ
+        iterations: 検索の繰り返し回数
+        
+    Returns:
+        list: 各検索の結果のリスト
+    """
+    results = []
+    
+    with st.status("🔍 ディープリサーチ実行中...", expanded=True) as status:
+        # 初回検索
+        st.write(f"**検索 1/{iterations}**: 基本情報の収集")
+        try:
+            initial_result = agent_executor.invoke({"input": query})
+            results.append({
+                "iteration": 1,
+                "type": "initial",
+                "result": initial_result
+            })
+            st.success("✅ 初回検索完了")
+        except Exception as e:
+            st.error(f"❌ 初回検索エラー: {str(e)}")
+            return results
+        
+        # 追加の深掘り検索
+        for i in range(iterations - 1):
+            st.write(f"**検索 {i+2}/{iterations}**: 詳細情報の追加収集")
+            
+            # 前回の結果から追加の質問を生成
+            follow_up_query = f"""
+            以下のトピックについて、さらに詳しく調査してください：
+            {query}
+            
+            前回の検索で得られた情報を踏まえて、特に以下の観点で情報を補完してください：
+            - 最新の動向やトレンド（過去6ヶ月以内）
+            - 具体的な数値データや統計
+            - 専門家の意見や評価
+            - 実際の事例やケーススタディ
+            
+            前回取得できなかった新しい情報を重点的に調査してください。
+            """
+            
+            try:
+                result = agent_executor.invoke({"input": follow_up_query})
+                results.append({
+                    "iteration": i + 2,
+                    "type": "follow_up",
+                    "result": result
+                })
+                st.success(f"✅ 検索 {i+2} 完了")
+                
+                # レート制限対策: 1秒待機
+                time.sleep(1)
+                
+            except Exception as e:
+                st.warning(f"⚠️ 検索 {i+2} でエラー: {str(e)}")
+                continue
+        
+        status.update(label="✅ ディープリサーチ完了", state="complete")
+    
+    return results
 
 # ===== API クライアント初期化 =====
 @st.cache_resource
@@ -280,6 +372,12 @@ with st.sidebar:
             value=5,
             step=1,
             help="検索する結果の数（多いほど詳細ですが時間がかかります）"
+        )
+        
+        deep_research = st.checkbox(
+            "🔬 ディープリサーチモード",
+            value=False,
+            help="3回の検索を実行してより包括的な情報を収集します"
         )
         
         if "BRAVE_SEARCH_API_KEY" not in st.secrets:
@@ -403,19 +501,55 @@ if prompt := st.chat_input("メッセージを入力してください..."):
     if enable_search and "BRAVE_SEARCH_API_KEY" in st.secrets:
         with st.chat_message("assistant"):
             try:
-                # 検索ツールの初期化
-                brave_search = init_brave_search(search_count if 'search_count' in locals() else 5)
+                # エージェントの初期化
+                agent_executor = init_search_agent(
+                    selected_model,
+                    search_count if 'search_count' in locals() else 5
+                )
                 
-                if brave_search is None:
-                    st.error("検索ツールの初期化に失敗しました。通常モードで回答します。")
+                if agent_executor is None:
+                    st.error("エージェントの初期化に失敗しました。通常モードで回答します。")
                     enable_search = False
                 else:
-                    st.info("🔍 Web検索を使用して回答を生成しています...")
-                    
-                    # 検索と回答生成を実行
-                    full_response = perform_search_and_generate_response(
-                        selected_model, brave_search, prompt
-                    )
+                    # ディープリサーチモードの判定
+                    if 'deep_research' in locals() and deep_research:
+                        st.info("🔬 ディープリサーチモードで実行します（3回の検索）")
+                        
+                        # ディープリサーチ実行
+                        results = execute_deep_research(
+                            agent_executor,
+                            prompt,
+                            iterations=3
+                        )
+                        
+                        # 結果の統合
+                        full_response = f"# 🔬 ディープリサーチ結果\n\n"
+                        full_response += f"**検索クエリ:** {prompt}\n\n"
+                        full_response += f"**実行時刻:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                        full_response += "---\n\n"
+                        
+                        for idx, res in enumerate(results, 1):
+                            full_response += f"## 検索フェーズ {idx}\n\n"
+                            full_response += res["result"]["output"] + "\n\n"
+                            full_response += "---\n\n"
+                        
+                        # 統合サマリー
+                        full_response += "## 📊 総合まとめ\n\n"
+                        full_response += f"上記{len(results)}回の検索から得られた情報を統合し、"
+                        full_response += "最新かつ包括的な回答を提供しました。\n"
+                        
+                    else:
+                        # 通常の検索（1回）
+                        st.info("🔍 Web検索を使用して回答を生成しています...")
+                        
+                        with st.expander("🔍 検索プロセス（詳細）", expanded=False):
+                            st_callback = StreamlitCallbackHandler(st.container())
+                            result = agent_executor.invoke(
+                                {"input": prompt},
+                                {"callbacks": [st_callback]}
+                            )
+                        
+                        full_response = result["output"]
                     
                     # レスポンスを表示
                     st.markdown(full_response)
@@ -424,6 +558,10 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                     with st.expander("📊 検索情報"):
                         st.write("✅ Web検索を使用して最新情報を取得しました")
                         st.write(f"**検索結果数:** {search_count if 'search_count' in locals() else 5}件")
+                        if 'deep_research' in locals() and deep_research:
+                            st.write(f"**モード:** ディープリサーチ（3回検索）")
+                        else:
+                            st.write(f"**モード:** 通常検索（1回）")
                         st.write(f"**使用モデル:** {selected_model_name}")
                         
             except Exception as e:
