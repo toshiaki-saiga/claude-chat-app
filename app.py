@@ -9,6 +9,13 @@ from langchain_anthropic import ChatAnthropic
 from langchain_community.tools import BraveSearch
 import time
 from datetime import datetime
+import pytz
+
+# ===== 日本時間取得関数 =====
+def get_jst_now():
+    """日本時間（JST）の現在時刻を取得"""
+    jst = pytz.timezone('Asia/Tokyo')
+    return datetime.now(jst)
 
 # ページ設定
 st.set_page_config(
@@ -89,9 +96,10 @@ def perform_search_and_generate_response(model_name: str, brave_search, query: s
         str: 検索結果を含む回答
     """
     try:
-        # 現在の日時情報
-        current_datetime = datetime.now().strftime("%Y年%m月%d日 %H時%M分")
-        current_weekday = datetime.now().strftime("%A")
+        # 現在の日時情報（日本時間）
+        jst_now = get_jst_now()
+        current_datetime = jst_now.strftime("%Y年%m月%d日 %H時%M分")
+        current_weekday = jst_now.strftime("%A")
         weekday_jp = {
             "Monday": "月曜日", "Tuesday": "火曜日", "Wednesday": "水曜日",
             "Thursday": "木曜日", "Friday": "金曜日", "Saturday": "土曜日", "Sunday": "日曜日"
@@ -238,8 +246,9 @@ with st.sidebar:
             import json
             from datetime import datetime
             
+            jst_now = get_jst_now()
             chat_data = {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": jst_now.isoformat(),
                 "model": selected_model_name,
                 "messages": st.session_state.get('messages', [])
             }
@@ -247,7 +256,7 @@ with st.sidebar:
             st.download_button(
                 label="💾 ダウンロード",
                 data=json.dumps(chat_data, ensure_ascii=False, indent=2),
-                file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                file_name=f"chat_{jst_now.strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json",
                 use_container_width=True
             )
@@ -439,9 +448,10 @@ if prompt := st.chat_input("メッセージを入力してください..."):
             full_response = ""
             
             try:
-                # 現在の日時情報を取得
-                current_datetime = datetime.now().strftime("%Y年%m月%d日 %H時%M分")
-                current_weekday = datetime.now().strftime("%A")
+                # 現在の日時情報を取得（日本時間）
+                jst_now = get_jst_now()
+                current_datetime = jst_now.strftime("%Y年%m月%d日 %H時%M分")
+                current_weekday = jst_now.strftime("%A")
                 
                 # 日本語曜日の変換
                 weekday_jp = {
