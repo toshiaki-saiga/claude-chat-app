@@ -1,24 +1,7 @@
 ﻿# Core packages
 streamlit==1.39.0
-anthropic>=0.69.0,<1.0.0
+anthropic>=0.39.0,<1.0.0  # Web検索機能(web_search_20250305)をサポートするバージョン
 pillow==10.4.0
 
-# LangChain integration (バージョン固定)
-langchain==0.2.16
-langchain-core==0.2.38
-langchain-community==0.2.16
-langchain-anthropic==0.1.23
-
-# HTTP clients
-requests>=2.31.0
-httpx>=0.24.0
-
-# Environment management
-python-dotenv>=1.0.0
-
-# Data processing
-pandas>=2.0.0
-pydantic>=2.0.0
-
-# Logging
-rich>=13.0.0,<14.0.0
+# Timezone support
+pytz>=2024.1

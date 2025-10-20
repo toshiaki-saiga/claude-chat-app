@@ -3,13 +3,9 @@ import anthropic
 import base64
 from PIL import Image
 import io
-
-# ===== Web Search Integration =====
-from langchain_anthropic import ChatAnthropic
-from langchain_community.tools import BraveSearch
-import time
 from datetime import datetime
 import pytz
+import json
 
 # ===== 日本時間取得関数 =====
 def get_jst_now():
@@ -58,122 +54,6 @@ def check_password():
 if not check_password():
     st.stop()
 
-# ===== Simple Search Function =====
-@st.cache_resource  
-def init_brave_search(search_results: int = 5):
-    """
-    Brave Searchツールを初期化
-    
-    Args:
-        search_results: 検索結果の数
-        
-    Returns:
-        BraveSearch: 初期化されたBrave Searchツール
-    """
-    try:
-        brave_search = BraveSearch.from_api_key(
-            api_key=st.secrets["BRAVE_SEARCH_API_KEY"],
-            search_kwargs={
-                "count": search_results,
-                "safesearch": "moderate"
-            }
-        )
-        return brave_search
-    except Exception as e:
-        st.error(f"Brave Search初期化エラー: {str(e)}")
-        return None
-
-def perform_search_and_generate_response(model_name: str, brave_search, query: str):
-    """
-    検索を実行してレスポンスを生成
-    
-    Args:
-        model_name: Claudeモデル名
-        brave_search: 検索ツール
-        query: 検索クエリ
-        
-    Returns:
-        str: 検索結果を含む回答
-    """
-    try:
-        # 現在の日時情報（日本時間）
-        jst_now = get_jst_now()
-        current_datetime = jst_now.strftime("%Y年%m月%d日 %H時%M分")
-        current_weekday = jst_now.strftime("%A")
-        weekday_jp = {
-            "Monday": "月曜日", "Tuesday": "火曜日", "Wednesday": "水曜日",
-            "Thursday": "木曜日", "Friday": "金曜日", "Saturday": "土曜日", "Sunday": "日曜日"
-        }
-        current_weekday_jp = weekday_jp.get(current_weekday, current_weekday)
-        
-        # 日付関連の質問かチェック
-        date_keywords = ["今日", "日付", "何日", "いつ", "曜日", "today", "date"]
-        is_date_question = any(keyword in query.lower() for keyword in date_keywords)
-        
-        if is_date_question and not any(keyword in query.lower() for keyword in ["ニュース", "news", "最新", "トレンド"]):
-            # 日付関連の基本質問は検索せずに直接回答
-            return f"現在の日時は{current_datetime}（{current_weekday_jp}）です。"
-        
-        # Web検索を実行
-        search_results = brave_search.run(query)
-        
-        # LLMの初期化
-        llm = ChatAnthropic(
-            model=model_name,
-            temperature=0.3,
-            max_tokens=4096,
-            anthropic_api_key=st.secrets["ANTHROPIC_API_KEY"]
-        )
-        
-        # 検索結果を使って回答を生成
-        enhanced_prompt = f"""現在の日時: {current_datetime} ({current_weekday_jp})
-
-以下の検索結果を参考に、ユーザーの質問「{query}」に対して正確で詳しい回答をしてください。
-
-検索結果:
-{search_results}
-
-上記の情報を基に、質問に対する包括的で正確な回答を日本語で提供してください。現在の日時情報も必要に応じて活用してください。"""
-        
-        # LLMに回答生成を依頼
-        response = llm.invoke([{"role": "user", "content": enhanced_prompt}])
-        return response.content
-        
-    except Exception as e:
-        return f"検索中にエラーが発生しました: {str(e)}"
-
-def rate_limited_search(func):
-    """
-    Brave Search APIのレート制限（1秒1リクエスト）に対応するデコレータ
-    
-    無料プランの制約:
-    - 1秒あたり1リクエスト
-    - 月間2,000リクエスト
-    """
-    last_call_time = [0]  # リストで包んで参照を保持
-    
-    def wrapper(*args, **kwargs):
-        current_time = time.time()
-        time_since_last_call = current_time - last_call_time[0]
-        
-        # 前回の呼び出しから1秒未満の場合は待機
-        if time_since_last_call < 1.0:
-            sleep_time = 1.0 - time_since_last_call
-            with st.spinner(f'レート制限のため {sleep_time:.1f}秒待機中...'):
-                time.sleep(sleep_time)
-        
-        result = func(*args, **kwargs)
-        last_call_time[0] = time.time()
-        
-        # 検索カウントの更新
-        if "search_count_today" not in st.session_state:
-            st.session_state.search_count_today = 0
-        st.session_state.search_count_today += 1
-        
-        return result
-    
-    return wrapper
-
 # ===== API クライアント初期化 =====
 @st.cache_resource
 def get_client():
@@ -188,9 +68,12 @@ with st.sidebar:
     # モデル選択
     model_options = {
         "Claude 4.5 Sonnet（最新・推奨）": "claude-sonnet-4-5-20250929",
-        "Claude 4.1 Opus（最高性能）": "claude-opus-4-20250514",
-        "Claude 3.5 Sonnet": "claude-3-5-sonnet-20241022",
-        "Claude 3.5 Haiku（高速・低コスト）": "claude-3-5-haiku-20241022",
+        "Claude 4.1 Opus（最高性能）": "claude-opus-4-1-20250805",
+        "Claude 4 Opus": "claude-opus-4-20250514",
+        "Claude 4 Sonnet": "claude-sonnet-4-20250514",
+        "Claude 3.5 Sonnet v2": "claude-3-5-sonnet-20241022",
+        "Claude 4.5 Haiku（高速・低コスト）": "claude-haiku-4-5-20251001",
+        "Claude 3.5 Haiku": "claude-3-5-haiku-20241022",
     }
     
     selected_model_name = st.selectbox(
@@ -246,66 +129,76 @@ with st.sidebar:
             import json
             from datetime import datetime
             
-            jst_now = get_jst_now()
-            chat_data = {
-                "timestamp": jst_now.isoformat(),
+            # 会話履歴をJSON形式で保存
+            chat_history = {
+                "timestamp": datetime.now().isoformat(),
                 "model": selected_model_name,
-                "messages": st.session_state.get('messages', [])
+                "messages": st.session_state.messages
             }
             
+            # ダウンロードボタンを表示
             st.download_button(
-                label="💾 ダウンロード",
-                data=json.dumps(chat_data, ensure_ascii=False, indent=2),
-                file_name=f"chat_{jst_now.strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-                use_container_width=True
+                label="💾 JSONとしてダウンロード",
+                data=json.dumps(chat_history, ensure_ascii=False, indent=2),
+                file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
             )
     
-    # 統計情報
     st.divider()
-    message_count = len(st.session_state.get('messages', []))
-    st.caption(f"💬 メッセージ数: {message_count}")
-    st.caption(f"🤖 使用モデル: {selected_model_name}")
     
-    # コスト試算
-    if 'total_tokens' in st.session_state:
-        st.caption(f"📊 累計トークン: {st.session_state.total_tokens:,}")
-    
-    # ===== Web Search Settings =====
-    st.divider()
+    # Web検索設定（Claude APIのネイティブ検索）
     st.subheader("🔍 Web検索設定")
-    
-    enable_search = st.toggle(
-        "Web検索を有効化",
+    enable_search = st.checkbox(
+        "Claude Web検索を有効化",
         value=False,
-        help="有効にすると、Claudeが必要に応じて最新のWeb情報を検索します"
+        help="Claude APIのネイティブWeb検索機能を使用します（$10/1000検索）"
     )
     
     if enable_search:
         search_count = st.slider(
-            "検索結果数",
+            "最大検索回数",
             min_value=1,
             max_value=10,
             value=5,
-            step=1,
-            help="検索する結果の数（多いほど詳細ですが時間がかかります）"
+            help="1回のレスポンスで実行する最大検索数"
         )
         
-        if "BRAVE_SEARCH_API_KEY" not in st.secrets:
-            st.error("❌ Brave Search APIキーが設定されていません")
-            st.caption("📝 .streamlit/secrets.tomlに以下を追加してください:")
-            st.code('BRAVE_SEARCH_API_KEY = "your-key"')
-            enable_search = False
-        else:
-            st.success("✅ Brave Search API 設定済み")
-            if "search_count_today" in st.session_state:
-                st.caption(f"🔍 本日の検索回数: {st.session_state.search_count_today}/2000")
+        # ドメインフィルタリング設定
+        use_domain_filter = st.checkbox("ドメインフィルタリングを使用", value=False)
+        
+        if use_domain_filter:
+            filter_type = st.radio(
+                "フィルタータイプ",
+                options=["許可リスト", "ブロックリスト"],
+                help="特定のドメインのみを許可またはブロック"
+            )
+            
+            domains_input = st.text_area(
+                f"{'許可' if filter_type == '許可リスト' else 'ブロック'}するドメイン（1行に1つ）",
+                placeholder="example.com\ntrusted-site.org",
+                help="HTTPSやサブドメインは含めないでください"
+            )
+        
+        # ローカライゼーション設定
+        use_location = st.checkbox("位置情報を使用", value=False)
+        
+        if use_location:
+            col1, col2 = st.columns(2)
+            with col1:
+                city = st.text_input("都市", value="Tokyo")
+                country = st.text_input("国", value="JP")
+            with col2:
+                region = st.text_input("地域", value="Tokyo")
+                timezone = st.text_input("タイムゾーン", value="Asia/Tokyo")
+        
+        st.info("💡 Claude Web検索は自動的に引用を含めて回答します")
+        st.caption("💰 価格: $10/1000検索 + 通常のトークン料金")
     
     st.divider()
 
 # ===== メインエリア =====
 st.title("🤖 Claude API チャット")
-st.caption("Claude APIを使った高機能チャットアプリ - 最新モデル対応")
+st.caption("Claude APIを使った高機能チャットアプリ - ネイティブWeb検索対応")
 
 # チャット履歴の初期化
 if "messages" not in st.session_state:
@@ -313,6 +206,9 @@ if "messages" not in st.session_state:
 
 if "total_tokens" not in st.session_state:
     st.session_state.total_tokens = 0
+
+if "total_searches" not in st.session_state:
+    st.session_state.total_searches = 0
 
 # ファイル処理関数
 def process_uploaded_file(file):
@@ -360,7 +256,7 @@ if uploaded_file and "uploaded_file_content" not in st.session_state:
         st.session_state.uploaded_file_content = file_content
         st.success(f"✅ {uploaded_file.name} をアップロードしました")
 
-# 過去のメッセージを表示
+# 過去のメッセージを表示（Web検索結果を適切に表示）
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         if isinstance(message["content"], str):
@@ -371,6 +267,16 @@ for message in st.session_state.messages:
                     st.markdown(content_block["text"])
                 elif content_block.get("type") == "image":
                     st.info("🖼️ 画像が添付されています")
+                elif content_block.get("type") == "server_tool_use":
+                    # Web検索クエリの表示
+                    if content_block.get("name") == "web_search":
+                        st.info(f"🔍 検索実行: {content_block.get('input', {}).get('query', '')}")
+                elif content_block.get("type") == "web_search_tool_result":
+                    # Web検索結果の表示（オプション）
+                    with st.expander("検索結果詳細"):
+                        for result in content_block.get("content", []):
+                            if result.get("type") == "web_search_result":
+                                st.write(f"- [{result.get('title')}]({result.get('url')})")
 
 # ユーザー入力
 if prompt := st.chat_input("メッセージを入力してください..."):
@@ -406,76 +312,132 @@ if prompt := st.chat_input("メッセージを入力してください..."):
         if len(user_message_content) > 1:
             st.info("🖼️ 画像が添付されています")
     
-    full_response = ""
-    
-    # ===== Web検索モード =====
-    if enable_search and "BRAVE_SEARCH_API_KEY" in st.secrets:
-        with st.chat_message("assistant"):
-            try:
-                # 検索ツールの初期化
-                brave_search = init_brave_search(search_count if 'search_count' in locals() else 5)
-                
-                if brave_search is None:
-                    st.error("検索ツールの初期化に失敗しました。通常モードで回答します。")
-                    enable_search = False
-                else:
-                    st.info("🔍 Web検索を使用して回答を生成しています...")
-                    
-                    # 検索と回答生成を実行
-                    full_response = perform_search_and_generate_response(
-                        selected_model, brave_search, prompt
-                    )
-                    
-                    # レスポンスを表示
-                    st.markdown(full_response)
-                    
-                    # 検索情報の表示
-                    with st.expander("📊 検索情報"):
-                        st.write("✅ Web検索を使用して最新情報を取得しました")
-                        st.write(f"**検索結果数:** {search_count if 'search_count' in locals() else 5}件")
-                        st.write(f"**使用モデル:** {selected_model_name}")
-                        
-            except Exception as e:
-                st.error(f"❌ 検索中にエラーが発生しました")
-                st.exception(e)
-                st.info("💡 通常モードで回答を試みます")
-                enable_search = False  # エラー時は通常モードにフォールバック
-    
-    # ===== 通常のClaude API呼び出し =====
-    if not enable_search or "BRAVE_SEARCH_API_KEY" not in st.secrets:
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            full_response = ""
+    # アシスタントの応答
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        full_response = ""
+        
+        try:
+            # 現在の日時情報を取得（日本時間）
+            jst_now = get_jst_now()
+            current_datetime = jst_now.strftime("%Y年%m月%d日 %H時%M分")
+            current_weekday = jst_now.strftime("%A")
             
-            try:
-                # 現在の日時情報を取得（日本時間）
-                jst_now = get_jst_now()
-                current_datetime = jst_now.strftime("%Y年%m月%d日 %H時%M分")
-                current_weekday = jst_now.strftime("%A")
-                
-                # 日本語曜日の変換
-                weekday_jp = {
-                    "Monday": "月曜日", "Tuesday": "火曜日", "Wednesday": "水曜日",
-                    "Thursday": "木曜日", "Friday": "金曜日", "Saturday": "土曜日", "Sunday": "日曜日"
+            # 日本語曜日の変換
+            weekday_jp = {
+                "Monday": "月曜日", "Tuesday": "火曜日", "Wednesday": "水曜日",
+                "Thursday": "木曜日", "Friday": "金曜日", "Saturday": "土曜日", "Sunday": "日曜日"
+            }
+            current_weekday_jp = weekday_jp.get(current_weekday, current_weekday)
+            
+            # システムメッセージに現在日時を含める
+            system_message = {
+                "role": "system",
+                "content": f"現在の日時: {current_datetime} ({current_weekday_jp})\n\n" +
+                          "日付や時刻について質問された場合は、上記の現在日時情報を使用して正確に回答してください。"
+            }
+            
+            # API呼び出し用のメッセージ形式に変換
+            api_messages = [system_message]
+            for msg in st.session_state.messages:
+                api_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+            
+            # Web検索ツールの設定
+            tools = None
+            if enable_search:
+                # 基本のツール設定
+                tool_config = {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": search_count
                 }
-                current_weekday_jp = weekday_jp.get(current_weekday, current_weekday)
                 
-                # システムメッセージに現在日時を含める
-                system_message = {
-                    "role": "system",
-                    "content": f"現在の日時: {current_datetime} ({current_weekday_jp})\n\n" +
-                              "日付や時刻について質問された場合は、上記の現在日時情報を使用して正確に回答してください。"
-                }
+                # ドメインフィルタリングの追加
+                if use_domain_filter and domains_input:
+                    domains = [d.strip() for d in domains_input.split('\n') if d.strip()]
+                    if domains:
+                        if filter_type == "許可リスト":
+                            tool_config["allowed_domains"] = domains
+                        else:
+                            tool_config["blocked_domains"] = domains
                 
-                # API呼び出し用のメッセージ形式に変換
-                api_messages = [system_message]
-                for msg in st.session_state.messages:
-                    api_messages.append({
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    })
+                # ローカライゼーションの追加
+                if use_location:
+                    tool_config["user_location"] = {
+                        "type": "approximate",
+                        "city": city,
+                        "region": region,
+                        "country": country,
+                        "timezone": timezone
+                    }
                 
-                # ストリーミング応答
+                tools = [tool_config]
+                
+                st.info("🔍 Web検索を使用して回答を生成しています...")
+            
+            # APIリクエストの実行
+            if tools:
+                # Web検索ありの場合（ストリーミングなし）
+                response = client.messages.create(
+                    model=selected_model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    messages=api_messages,
+                    tools=tools
+                )
+                
+                # レスポンスの処理
+                response_content = []
+                search_queries = []
+                citations = []
+                
+                for content_block in response.content:
+                    if content_block.type == "text":
+                        full_response += content_block.text
+                        # 引用がある場合の処理
+                        if hasattr(content_block, 'citations'):
+                            for citation in content_block.citations:
+                                citations.append({
+                                    "url": citation.url,
+                                    "title": citation.title,
+                                    "text": citation.cited_text[:150]  # 最大150文字
+                                })
+                    elif content_block.type == "server_tool_use":
+                        if content_block.name == "web_search":
+                            query = content_block.input.get("query", "")
+                            search_queries.append(query)
+                            st.info(f"🔍 検索中: {query}")
+                
+                # 最終的なレスポンスを表示
+                message_placeholder.markdown(full_response)
+                
+                # 検索情報の表示
+                if search_queries:
+                    with st.expander("📊 Web検索情報"):
+                        st.write(f"**実行した検索数:** {len(search_queries)}件")
+                        st.write("**検索クエリ:**")
+                        for i, query in enumerate(search_queries, 1):
+                            st.write(f"{i}. {query}")
+                        
+                        if citations:
+                            st.write("**引用ソース:**")
+                            for citation in citations:
+                                st.write(f"- [{citation['title']}]({citation['url']})")
+                                st.caption(f"  {citation['text']}...")
+                
+                # 使用状況の更新
+                st.session_state.total_searches += len(search_queries)
+                
+                # トークン使用量の取得
+                input_tokens = response.usage.input_tokens
+                output_tokens = response.usage.output_tokens
+                web_searches = response.usage.get('server_tool_use', {}).get('web_search_requests', 0)
+                
+            else:
+                # Web検索なしの場合（ストリーミングあり）
                 with client.messages.stream(
                     model=selected_model,
                     max_tokens=max_tokens,
@@ -493,45 +455,107 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                     final_message = stream.get_final_message()
                     input_tokens = final_message.usage.input_tokens
                     output_tokens = final_message.usage.output_tokens
+                    web_searches = 0
+            
+            # 累計トークンを更新
+            st.session_state.total_tokens += input_tokens + output_tokens
+            
+            # 使用量情報を表示
+            with st.expander("📊 使用情報"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**トークン使用量**")
+                    st.write(f"入力: {input_tokens:,}")
+                    st.write(f"出力: {output_tokens:,}")
+                    st.write(f"累計: {st.session_state.total_tokens:,}")
+                
+                with col2:
+                    st.write("**コスト試算**")
                     
-                    # 累計トークンを更新
-                    st.session_state.total_tokens += input_tokens + output_tokens
-                    
-                    # トークン使用量を表示
-                    with st.expander("📊 使用トークン情報"):
-                        st.write(f"入力トークン: {input_tokens:,}")
-                        st.write(f"出力トークン: {output_tokens:,}")
-                        
-                        # コスト試算
-                        if "opus-4" in selected_model:
+                    # モデルごとの料金計算
+                    if "opus-4" in selected_model:
+                        if "4-1" in selected_model:
                             input_cost = (input_tokens / 1_000_000) * 15.00
                             output_cost = (output_tokens / 1_000_000) * 75.00
-                        elif "sonnet-4" in selected_model:
+                        else:
+                            input_cost = (input_tokens / 1_000_000) * 15.00
+                            output_cost = (output_tokens / 1_000_000) * 75.00
+                    elif "sonnet-4" in selected_model:
+                        if "4-5" in selected_model:
                             input_cost = (input_tokens / 1_000_000) * 3.00
                             output_cost = (output_tokens / 1_000_000) * 15.00
-                        elif "haiku" in selected_model:
-                            input_cost = (input_tokens / 1_000_000) * 0.25
-                            output_cost = (output_tokens / 1_000_000) * 1.25
                         else:
                             input_cost = (input_tokens / 1_000_000) * 3.00
                             output_cost = (output_tokens / 1_000_000) * 15.00
-                        
-                        total_cost = input_cost + output_cost
-                        st.write(f"💰 このメッセージのコスト: ${total_cost:.6f}")
+                    elif "haiku" in selected_model:
+                        if "4-5" in selected_model:
+                            input_cost = (input_tokens / 1_000_000) * 1.00
+                            output_cost = (output_tokens / 1_000_000) * 5.00
+                        else:
+                            input_cost = (input_tokens / 1_000_000) * 0.25
+                            output_cost = (output_tokens / 1_000_000) * 1.25
+                    else:
+                        # デフォルト（Sonnet 3.5）
+                        input_cost = (input_tokens / 1_000_000) * 3.00
+                        output_cost = (output_tokens / 1_000_000) * 15.00
                     
-            except Exception as e:
-                st.error(f"❌ エラーが発生しました: {str(e)}")
-                full_response = None
+                    # Web検索コスト
+                    search_cost = web_searches * 0.01  # $10/1000検索 = $0.01/検索
+                    
+                    total_cost = input_cost + output_cost + search_cost
+                    
+                    st.write(f"トークン: ${input_cost + output_cost:.6f}")
+                    if web_searches > 0:
+                        st.write(f"検索: ${search_cost:.6f}")
+                    st.write(f"**合計: ${total_cost:.6f}**")
+                
+                if web_searches > 0:
+                    st.write(f"**Web検索実行数:** {web_searches}回")
+                    st.write(f"**累計検索数:** {st.session_state.total_searches}回")
+                    
+        except Exception as e:
+            st.error(f"❌ エラーが発生しました: {str(e)}")
+            
+            # エラーの詳細を表示
+            if "server_tool_use" in str(e):
+                st.info("💡 Web検索機能がまだ有効化されていない可能性があります。")
+                st.info("Anthropic Consoleで組織レベルでWeb検索を有効化する必要があります。")
+            
+            full_response = None
     
     # アシスタントメッセージを履歴に追加
     if full_response:
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": full_response
-        })
+        # レスポンス全体を保存（Web検索結果も含む）
+        if enable_search and 'response' in locals():
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response.content
+            })
+        else:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": full_response
+            })
 
 # フッター
 st.divider()
-st.caption("💡 ヒント: 左側のサイドバーでモデルやファイルを選択できます")
-st.caption("🔍 Web検索を有効にすると、最新情報を取得できます")
+
+# 使用統計の表示
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.metric("総トークン数", f"{st.session_state.total_tokens:,}")
+
+with col2:
+    st.metric("総検索数", f"{st.session_state.total_searches:,}")
+
+with col3:
+    # 概算コストの計算（デフォルトでSonnet料金で計算）
+    estimated_cost = (st.session_state.total_tokens / 1_000_000) * 10.00  # 平均的な見積もり
+    estimated_cost += st.session_state.total_searches * 0.01
+    st.metric("概算コスト", f"${estimated_cost:.4f}")
+
+st.caption("💡 ヒント: 左側のサイドバーでモデルやWeb検索設定を調整できます")
+st.caption("🔍 Claude Web検索: 自動的に最新情報を取得し、引用付きで回答します")
 st.caption("🔒 このアプリはパスワードで保護されています")
