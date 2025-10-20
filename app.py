@@ -330,20 +330,21 @@ if prompt := st.chat_input("メッセージを入力してください..."):
             }
             current_weekday_jp = weekday_jp.get(current_weekday, current_weekday)
             
-            # システムメッセージに現在日時を含める
-            system_message = {
-                "role": "system",
-                "content": f"現在の日時: {current_datetime} ({current_weekday_jp})\n\n" +
-                          "日付や時刻について質問された場合は、上記の現在日時情報を使用して正確に回答してください。"
-            }
+            # システムメッセージの内容を準備（トップレベルパラメータとして使用）
+            system_content = (
+                f"現在の日時: {current_datetime} ({current_weekday_jp})\n\n"
+                "日付や時刻について質問された場合は、上記の現在日時情報を使用して正確に回答してください。"
+            )
             
-            # API呼び出し用のメッセージ形式に変換
-            api_messages = [system_message]
+            # API呼び出し用のメッセージ形式に変換（userとassistantのみ）
+            api_messages = []
             for msg in st.session_state.messages:
-                api_messages.append({
-                    "role": msg["role"],
-                    "content": msg["content"]
-                })
+                # roleがuserまたはassistantの場合のみ追加
+                if msg["role"] in ["user", "assistant"]:
+                    api_messages.append({
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    })
             
             # Web検索ツールの設定
             tools = None
@@ -385,6 +386,7 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                     model=selected_model,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    system=system_content,  # システムメッセージをトップレベルで指定
                     messages=api_messages,
                     tools=tools
                 )
@@ -395,21 +397,27 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                 citations = []
                 
                 for content_block in response.content:
-                    if content_block.type == "text":
-                        full_response += content_block.text
-                        # 引用がある場合の処理
-                        if hasattr(content_block, 'citations'):
-                            for citation in content_block.citations:
-                                citations.append({
-                                    "url": citation.url,
-                                    "title": citation.title,
-                                    "text": citation.cited_text[:150]  # 最大150文字
-                                })
-                    elif content_block.type == "server_tool_use":
-                        if content_block.name == "web_search":
-                            query = content_block.input.get("query", "")
-                            search_queries.append(query)
-                            st.info(f"🔍 検索中: {query}")
+                    if hasattr(content_block, 'type'):
+                        if content_block.type == "text":
+                            full_response += content_block.text
+                            # 引用がある場合の処理
+                            if hasattr(content_block, 'citations') and content_block.citations:
+                                for citation in content_block.citations:
+                                    citations.append({
+                                        "url": getattr(citation, 'url', ''),
+                                        "title": getattr(citation, 'title', ''),
+                                        "text": getattr(citation, 'cited_text', '')[:150]
+                                    })
+                        elif content_block.type == "server_tool_use":
+                            if hasattr(content_block, 'name') and content_block.name == "web_search":
+                                if hasattr(content_block, 'input') and hasattr(content_block.input, 'query'):
+                                    query = content_block.input.query
+                                elif hasattr(content_block, 'input') and isinstance(content_block.input, dict):
+                                    query = content_block.input.get("query", "")
+                                else:
+                                    query = "検索クエリ不明"
+                                search_queries.append(query)
+                                st.info(f"🔍 検索中: {query}")
                 
                 # 最終的なレスポンスを表示
                 message_placeholder.markdown(full_response)
@@ -432,9 +440,22 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                 st.session_state.total_searches += len(search_queries)
                 
                 # トークン使用量の取得
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
-                web_searches = response.usage.get('server_tool_use', {}).get('web_search_requests', 0)
+                if hasattr(response, 'usage'):
+                    input_tokens = getattr(response.usage, 'input_tokens', 0)
+                    output_tokens = getattr(response.usage, 'output_tokens', 0)
+                    
+                    # Web検索使用量の取得（安全に処理）
+                    web_searches = 0
+                    if hasattr(response.usage, 'server_tool_use'):
+                        server_tool_use = response.usage.server_tool_use
+                        if isinstance(server_tool_use, dict):
+                            web_searches = server_tool_use.get('web_search_requests', 0)
+                        elif hasattr(server_tool_use, 'web_search_requests'):
+                            web_searches = server_tool_use.web_search_requests
+                else:
+                    input_tokens = 0
+                    output_tokens = 0
+                    web_searches = len(search_queries)  # フォールバック: クエリ数から推定
                 
             else:
                 # Web検索なしの場合（ストリーミングあり）
@@ -442,6 +463,7 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                     model=selected_model,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    system=system_content,  # システムメッセージをトップレベルで指定
                     messages=api_messages
                 ) as stream:
                     for text in stream.text_stream:
@@ -515,12 +537,25 @@ if prompt := st.chat_input("メッセージを入力してください..."):
                     st.write(f"**累計検索数:** {st.session_state.total_searches}回")
                     
         except Exception as e:
-            st.error(f"❌ エラーが発生しました: {str(e)}")
+            error_msg = str(e)
+            st.error(f"❌ エラーが発生しました: {error_msg}")
             
             # エラーの詳細を表示
-            if "server_tool_use" in str(e):
-                st.info("💡 Web検索機能がまだ有効化されていない可能性があります。")
-                st.info("Anthropic Consoleで組織レベルでWeb検索を有効化する必要があります。")
+            if "web_search_20250305" in error_msg or "server_tool_use" in error_msg:
+                st.warning("⚠️ Web検索機能のエラーです")
+                st.info("**考えられる原因:**")
+                st.info("1. Anthropic Consoleで組織レベルでWeb検索が有効化されていない")
+                st.info("2. APIキーにWeb検索の権限がない")
+                st.info("3. Web検索の利用上限に達している")
+                st.caption("詳細: https://console.anthropic.com で設定を確認してください")
+            elif "invalid_request_error" in error_msg:
+                st.warning("⚠️ APIリクエストの形式にエラーがあります")
+                st.info("モデルの選択や設定を確認してください")
+            elif "authentication" in error_msg.lower():
+                st.warning("⚠️ APIキーの認証エラーです")
+                st.info("secrets.tomlのANTHROPIC_API_KEYを確認してください")
+            else:
+                st.info("💡 予期しないエラーが発生しました。設定を確認してください。")
             
             full_response = None
     
